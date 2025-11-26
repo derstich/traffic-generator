@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: curl-yelb
+  labels:
+    name: curl-yelb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    com.illumio.app: friendly-user
+    com.illumio.role: good
+  name: curl-yelb
+  namespace: curl-yelb
+  labels:
+    app: curl-yelb
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: curl-yelb4
+  template:
+    metadata:
+      labels:
+        app: curl-yelb
+    spec:
+      containers:
+      - name: curl-yelb
+        image: ubuntu:24.04
+        imagePullPolicy: IfNotPresent
+        command: [ "/bin/bash", "-c" ]
+        args:
+          - apt-get update && apt-get install curl -y;
+            while true; do curl http://yelb-ui.yelb.svc.cluster.local; http://yelb-ui.yelb.svc.cluster.local//api/chipotle; http://yelb-ui.yelb.svc.cluster.local//api/ihop; http://yelb-ui.yelb.svc.cluster.local//api/outback; http://yelb-ui.yelb.svc.cluster.local//api/bucadibeppo; sleep 30; done;
+            sleep infinity;
