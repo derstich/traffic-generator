@@ -32,5 +32,5 @@ spec:
         command: [ "/bin/bash", "-c" ]
         args:
           - apt-get update && apt-get install curl -y;
-            while true; do curl http://yelb-ui.yelb.svc.cluster.local; curl http://yelb-ui.yelb.svc.cluster.local//api/chipotle; curl http://yelb-ui.yelb.svc.cluster.local//api/ihop; curl http://yelb-ui.yelb.svc.cluster.local//api/outback; curl http://yelb-ui.yelb.svc.cluster.local//api/bucadibeppo; sleep 30; done;
+            while true; do curl http://yelb-ui.yelb.svc.cluster.local; curl http://yelb-ui.yelb.svc.cluster.local//api/chipotle; curl http://yelb-ui.yelb.svc.cluster.local//api/ihop; curl http://yelb-ui.yelb.svc.cluster.local//api/outback; curl http://yelb-ui.yelb.svc.cluster.local//api/bucadibeppo; sleep 600; done;
             sleep infinity;
