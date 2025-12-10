@@ -1,3 +1,4 @@
+
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -5,32 +6,35 @@ metadata:
   labels:
     name: curl-yelb
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Pod
 metadata:
+  name: curl-yelb
+  namespace: curl-yelb
   annotations:
     com.illumio.app: friendly-user
     com.illumio.role: good
-  name: curl-yelb
-  namespace: curl-yelb
   labels:
     app: curl-yelb
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: curl-yelb
-  template:
-    metadata:
-      labels:
-        app: curl-yelb
-    spec:
-      containers:
-      - name: curl-yelb
-        image: ubuntu:24.04
-        imagePullPolicy: IfNotPresent
-        command: [ "/bin/bash", "-c" ]
-        args:
-          - apt-get update && apt-get install curl -y;
-            while true; do curl http://yelb-ui.yelb.svc.cluster.local; curl http://yelb-ui.yelb.svc.cluster.local//api/chipotle; curl http://yelb-ui.yelb.svc.cluster.local//api/ihop; curl http://yelb-ui.yelb.svc.cluster.local//api/outback; curl http://yelb-ui.yelb.svc.cluster.local//api/bucadibeppo; sleep 600; done;
-            sleep infinity;
+  restartPolicy: Never
+  containers:
+    - name: curl-yelb
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [ "/bin/sh", "-c" ]
+      args:
+        - |
+          set -eux
+          apk add --no-cache curl
+          # Curl to the endpoint every 10 minutes
+          while true; do
+            curl -sS http://yelb-ui.yelb.svc.cluster.local
+            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/chipotle
+            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/ihop
+            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/outback
+            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/bucadibeppo
+            sleep 600
+          done
+          # Pod keep alive
+          sleep infinity
