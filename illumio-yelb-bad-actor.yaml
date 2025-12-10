@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bad-actor
+  labels:
+    name: bad-actor
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: psql-config
+  namespace: bad-actor
+data:
+  PGHOST: "yelb-db.yelb.svc.cluster.local"
+  PGUSER: "postgres"
+  PGDATABASE: "yelbdatabase"
+  PGPASSWORD: "postgres_password"
+  psql_run_queries.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Require env vars
+    : "${PGHOST:?PGHOST is required}"
+    : "${PGUSER:?PGUSER is required}"
+    : "${PGDATABASE:?PGDATABASE is required}"
+    : "${PGPASSWORD:?PGPASSWORD is required}"
+
+    if ! command -v psql >/dev/null 2>&1; then
+      echo "Error: 'psql' is not installed or not in PATH." >&2
+      exit 1
+    fi
+
+    echo "Connecting to ${PGHOST} (database: ${PGDATABASE}) as ${PGUSER}..."
+
+    # Show current data
+    PGPASSWORD="$PGPASSWORD" psql \
+      --host="$PGHOST" \
+      --username="$PGUSER" \
+      --dbname="$PGDATABASE" \
+      --set=ON_ERROR_STOP=1 \
+      --command="SELECT * FROM restaurants;"
+
+    # Update IHOP record (count -> 0). Quote "count" to avoid conflict with COUNT()
+    PGPASSWORD="$PGPASSWORD" psql \
+      --host="$PGHOST" \
+      --username="$PGUSER" \
+      --dbname="$PGDATABASE" \
+      --set=ON_ERROR_STOP=1 \
+      --command="UPDATE restaurants SET \"count\" = 0 WHERE name = 'ihop';"
+
+    # Verify the update
+    PGPASSWORD="$PGPASSWORD" psql \
+      --host="$PGHOST" \
+      --username="$PGUSER" \
+      --dbname="$PGDATABASE" \
+      --set=ON_ERROR_STOP=1 \
+      --command="SELECT * FROM restaurants WHERE name = 'ihop';"
+
+    echo "Done."
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    com.illumio.app: attacker
+    com.illumio.role: evil
+  name: bad-actor
+  namespace: bad-actor
+  labels:
+    app: bad-actor
+spec:
+  restartPolicy: Never
+
+  # Init container: copy script from read-only configmap to writable emptyDir and chmod +x
+  initContainers:
+    - name: init-copy-script
+      image: alpine:3.20
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eux
+          cp /opt/scripts_ro/psql_run_queries.sh /work/psql_run_queries.sh
+          chmod +x /work/psql_run_queries.sh
+      volumeMounts:
+        - name: scripts-ro
+          mountPath: /opt/scripts_ro
+        - name: workdir
+          mountPath: /work
+
+  containers:
+    - name: alpine
+      image: alpine:3.20
+      # Install psql client at startup, then keep the pod running
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eux
+          apk add --no-cache postgresql-client curl busybox-extras
+          while true; do curl http://yelb-ui.yelb.svc.cluster.local; telnet yelb-db.yelb.svc.cluster.local 5432; telnet yelb-appserver.yelb.svc.cluster.local 4567; telnet redis-server.yelb.svc.cluster.local 6379; sleep 30; done;
+          sleep infinity;
+      envFrom:
+        - configMapRef:
+            name: psql-config
+      volumeMounts:
+        - name: workdir
+          mountPath: /work
+
+  volumes:
+    # Read-only ConfigMap volume containing the script
+    - name: scripts-ro
+      configMap:
+        name: psql-config
+        items:
+          - key: psql_run_queries.sh
+            path: psql_run_queries.sh
+    # Writable workspace where the executable script will live
+    - name: workdir
+      emptyDir: {}
+
