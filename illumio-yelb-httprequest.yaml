@@ -1,4 +1,3 @@
-
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -6,35 +5,96 @@ metadata:
   labels:
     name: curl-yelb
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: curl-yelb
   namespace: curl-yelb
-  annotations:
-    com.illumio.app: friendly-user
-    com.illumio.role: good
   labels:
     app: curl-yelb
 spec:
-  restartPolicy: Never
-  containers:
-    - name: curl-yelb
-      image: alpine:3.20
-      imagePullPolicy: IfNotPresent
-      command: [ "/bin/sh", "-c" ]
-      args:
-        - |
-          set -eux
-          apk add --no-cache curl
-          # Curl to the endpoint every 10 minutes
-          while true; do
-            curl -sS http://yelb-ui.yelb.svc.cluster.local
-            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/chipotle
-            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/ihop
-            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/outback
-            curl -sS http://yelb-ui.yelb.svc.cluster.local/api/bucadibeppo
-            sleep 600
-          done
-          # Pod keep alive
-          sleep infinity
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curl-yelb
+  template:
+    metadata:
+      labels:
+        app: curl-yelb
+      annotations:
+        com.illumio.app: friendly-user
+        com.illumio.role: good
+    spec:
+      # Für Deployments ist restartPolicy standardmäßig Always (gewünscht)
+      containers:
+        - name: curl-yelb
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              #!/bin/sh
+              # Keine "strict mode" Abbrüche: wir behandeln Fehler explizit.
+              INTERVAL=600           # alle 10 Minuten wie im Original
+              MAX_RETRIES=3          # Anzahl der Retries pro Call
+              TIMEOUT=5              # Timeout pro HTTP-Request (Sekunden)
+
+              log() { echo "[$(date -Iseconds)] $*"; }
+
+              ensure_curl() {
+                if command -v curl >/dev/null 2>&1; then
+                  return 0
+                fi
+                log "curl nicht vorhanden – versuche Installation über apk ..."
+                i=1
+                while [ $i -le 5 ]; do
+                  # Update + Installation; Fehler führen NICHT zum Exit
+                  if apk update >/dev/null 2>&1 && apk add --no-cache curl >/dev/null 2>&1; then
+                    log "curl erfolgreich installiert."
+                    return 0
+                  else
+                    log "apk fehlgeschlagen (Versuch $i/5) – warte und versuche erneut ..."
+                    sleep $(( i * 2 ))
+                    i=$(( i + 1 ))
+                  fi
+                done
+                log "Warnung: curl konnte nicht installiert werden – retry in der Hauptschleife."
+                return 1
+              }
+
+              do_call_with_retry() {
+                cmd="$1"
+                attempt=1
+                while [ $attempt -le "$MAX_RETRIES" ]; do
+                  # Request mit Timeout ausführen; Exit-Code prüfen
+                  sh -c "$cmd" >/dev/null 2>&1
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    log "OK: $cmd"
+                    return 0
+                  else
+                    log "FAIL (rc=$rc) – $cmd (Versuch $attempt/$MAX_RETRIES)"
+                    sleep $(( attempt * 2 ))     # einfacher Backoff
+                    attempt=$(( attempt + 1 ))
+                  fi
+                done
+                log "Alle Versuche fehlgeschlagen: $cmd"
+                return 1
+              }
+
+              # Hauptschleife: Container bleibt immer an
+              while true; do
+                # Sicherstellen, dass curl verfügbar ist (ggf. erneute Versuche)
+                ensure_curl || true
+
+                # === ALLE CALLS – aus deinem Original, unverändert in diesem YAML ===
+                do_call_with_retry "curl -fsS --max-time ${TIMEOUT} http://yelb-ui.yelb.svc.cluster.local"
+                do_call_with_retry "curl -fsS --max-time ${TIMEOUT} http://yelb-ui.yelb.svc.cluster.local/api/chipotle"
+                do_call_with_retry "curl -fsS --max-time ${TIMEOUT} http://yelb-ui.yelb.svc.cluster.local/api/ihop"
+                do_call_with_retry "curl -fsS --max-time ${TIMEOUT} http://yelb-ui.yelb.svc.cluster.local/api/outback"
+                do_call_with_retry "curl -fsS --max-time ${TIMEOUT} http://yelb-ui.yelb.svc.cluster.local/api/bucadibeppo"
+                # ===================================================================
+
+                log "Schlaf für ${INTERVAL}s bis zum nächsten Durchlauf ..."
+                sleep "${INTERVAL}"
+              done
