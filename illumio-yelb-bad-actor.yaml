@@ -17,47 +17,47 @@ data:
   PGPASSWORD: "postgres_password"
   psql_run_queries.sh: |
     #!/usr/bin/env sh
-    set -eu
+    # Robustes psql-Script: Fehler werden geloggt, kein hartes Exit.
+    set -u
 
-    # Require env vars
-    : "${PGHOST:?PGHOST is required}"
-    : "${PGUSER:?PGUSER is required}"
-    : "${PGDATABASE:?PGDATABASE is required}"
-    : "${PGPASSWORD:?PGPASSWORD is required}"
+    require_env() {
+      missing=0
+      for v in PGHOST PGUSER PGDATABASE PGPASSWORD; do
+        eval "val=\${$v:-}"
+        if [ -z "$val" ]; then
+          echo "WARN: $v is required but not set." >&2
+          missing=1
+        fi
+      done
+      return $missing
+    }
 
+    log() { echo "[$(date -Iseconds)] $*"; }
+
+    run_psql() {
+      PGPASSWORD="$PGPASSWORD" psql \
+        --host="$PGHOST" \
+        --username="$PGUSER" \
+        --dbname="$PGDATABASE" \
+        --set=ON_ERROR_STOP=1 \
+        "$@" 2>&1 || {
+          rc=$?
+          log "psql failed (rc=$rc) with args: $*"
+          return $rc
+        }
+    }
+
+    require_env || log "WARN: missing env vars—continuing anyway."
     if ! command -v psql >/dev/null 2>&1; then
-      echo "Error: 'psql' is not installed or not in PATH." >&2
-      exit 1
+      log "ERROR: 'psql' not found; exiting with 0 to avoid killing caller."
+      exit 0
     fi
 
-    echo "Connecting to ${PGHOST} (database: ${PGDATABASE}) as ${PGUSER}..."
-
-    # Show current data
-    PGPASSWORD="$PGPASSWORD" psql \
-      --host="$PGHOST" \
-      --username="$PGUSER" \
-      --dbname="$PGDATABASE" \
-      --set=ON_ERROR_STOP=1 \
-      --command="SELECT * FROM restaurants;"
-
-    # Update IHOP record (count -> 0). Quote "count" to avoid conflict with COUNT()
-    PGPASSWORD="$PGPASSWORD" psql \
-      --host="$PGHOST" \
-      --username="$PGUSER" \
-      --dbname="$PGDATABASE" \
-      --set=ON_ERROR_STOP=1 \
-      --command="UPDATE restaurants SET \"count\" = 0 WHERE name = 'ihop';"
-
-    # Verify the update
-    PGPASSWORD="$PGPASSWORD" psql \
-      --host="$PGHOST" \
-      --username="$PGUSER" \
-      --dbname="$PGDATABASE" \
-      --set=ON_ERROR_STOP=1 \
-      --command="SELECT * FROM restaurants WHERE name = 'ihop';"
-
-    echo "Done."
-
+    log "Connecting to ${PGHOST} (database: ${PGDATABASE}) as ${PGUSER}..."
+    run_psql --command="SELECT * FROM restaurants;"
+    run_psql --command="UPDATE restaurants SET \"count\" = 0 WHERE name = 'ihop';"
+    run_psql --command="SELECT * FROM restaurants WHERE name = 'ihop';"
+    log "Done."
 ---
 apiVersion: v1
 kind: Pod
@@ -70,9 +70,12 @@ metadata:
   labels:
     app: bad-actor
 spec:
+  # Explizit Never, wie gewünscht
   restartPolicy: Never
 
-  # Init container: copy script from read-only configmap to writable emptyDir and chmod +x
+  # Explizit einen ServiceAccount setzen (Workaround für Webhook Pfade)
+  serviceAccountName: default
+
   initContainers:
     - name: init-copy-script
       image: alpine:3.20
@@ -80,9 +83,22 @@ spec:
         - /bin/sh
         - -c
         - |
-          set -eux
-          cp /opt/scripts_ro/psql_run_queries.sh /work/psql_run_queries.sh
-          chmod +x /work/psql_run_queries.sh
+          #!/bin/sh
+          set -u
+          i=1
+          while [ $i -le 5 ]; do
+            if cp /opt/scripts_ro/psql_run_queries.sh /work/psql_run_queries.sh 2>/dev/null; then
+              chmod +x /work/psql_run_queries.sh || true
+              echo "[$(date -Iseconds)] Script copied to /work and chmod +x"
+              exit 0
+            else
+              echo "[$(date -Iseconds)] cp failed (attempt $i/5) — retrying ..."
+              sleep $(( i * 2 ))
+              i=$(( i + 1 ))
+            fi
+          done
+          echo "[$(date -Iseconds)] WARN: Could not copy script after retries; continuing."
+          exit 0
       volumeMounts:
         - name: scripts-ro
           mountPath: /opt/scripts_ro
@@ -92,14 +108,79 @@ spec:
   containers:
     - name: alpine
       image: alpine:3.20
-      # Install psql client at startup, then keep the pod running
       command:
         - /bin/sh
         - -c
         - |
-          set -eux
-          apk add --no-cache postgresql-client curl busybox-extras
-          while true; do curl http://yelb-ui.yelb.svc.cluster.local; telnet yelb-db.yelb.svc.cluster.local 5432; telnet yelb-appserver.yelb.svc.cluster.local 4567; telnet redis-server.yelb.svc.cluster.local 6379; sleep 30; done;
+          #!/bin/sh
+          set -u
+          log() { echo "[$(date -Iseconds)] $*"; }
+
+          ensure_packages() {
+            pkgs="postgresql-client curl busybox-extras"
+            i=1
+            while [ $i -le 5 ]; do
+              if apk update >/dev/null 2>&1 && apk add --no-cache $pkgs >/dev/null 2>&1; then
+                log "Packages installed: $pkgs"
+                return 0
+              else
+                log "apk add failed (attempt $i/5) — retrying ..."
+                sleep $(( i * 2 ))
+                i=$(( i + 1 ))
+              fi
+            done
+            log "WARN: apk install still failing; continuing without guaranteed tools."
+            return 1
+          }
+
+          http_get() {
+            url="$1"; timeout="${2:-5}"
+            if curl -fsS --max-time "$timeout" "$url" >/dev/null 2>&1; then
+              log "HTTP OK: $url"; return 0
+            else
+              log "HTTP FAIL: $url"; return 1
+            fi
+          }
+
+          port_check() {
+            host="$1"; port="$2"; timeout="${3:-3}"
+            if command -v nc >/dev/null 2>&1; then
+              if nc -z -w "$timeout" "$host" "$port" >/dev/null 2>&1; then
+                log "TCP OK: $host:$port"; return 0
+              else
+                log "TCP FAIL (nc): $host:$port"; return 1
+              fi
+            elif command -v timeout >/dev/null 2>&1 && command -v telnet >/dev/null 2>&1; then
+              if timeout "$timeout" telnet "$host" "$port" >/dev/null 2>&1; then
+                log "TCP OK (telnet): $host:$port"; return 0
+              else
+                log "TCP FAIL (telnet): $host:$port"; return 1
+              fi
+            else
+              log "WARN: neither nc nor (timeout+telnet) available for $host:$port"
+              return 2
+            fi
+          }
+
+          ensure_packages || true
+
+          while true; do
+            # HTTP Calls (deine Original-Endpoints)
+            http_get "http://yelb-ui.yelb.svc.cluster.local" 5
+            http_get "http://yelb-ui.yelb.svc.cluster.local/api/chipotle" 5
+            http_get "http://yelb-ui.yelb.svc.cluster.local/api/ihop" 5
+            http_get "http://yelb-ui.yelb.svc.cluster.local/api/outback" 5
+            http_get "http://yelb-ui.yelb.svc.cluster.local/api/bucadibeppo" 5
+
+            # TCP-Port Checks
+            port_check "yelb-db.yelb.svc.cluster.local" 5432 3
+            port_check "yelb-appserver.yelb.svc.cluster.local" 4567 3
+            port_check "redis-server.yelb.svc.cluster.local" 6379 3
+
+            sleep 30
+          done
+
+          # Sicherheitsnetz
           sleep infinity;
       envFrom:
         - configMapRef:
@@ -107,16 +188,23 @@ spec:
       volumeMounts:
         - name: workdir
           mountPath: /work
+      # >>> WICHTIG: Ports deklarieren (Workaround gegen Webhook-Panic bei leerem ports-Array)
+      ports:
+        - name: http
+          containerPort: 80
+        - name: pg
+          containerPort: 5432
+        - name: app
+          containerPort: 4567
+        - name: redis
+          containerPort: 6379
 
   volumes:
-    # Read-only ConfigMap volume containing the script
     - name: scripts-ro
       configMap:
         name: psql-config
         items:
           - key: psql_run_queries.sh
             path: psql_run_queries.sh
-    # Writable workspace where the executable script will live
     - name: workdir
       emptyDir: {}
-
